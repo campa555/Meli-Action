@@ -1,4 +1,4 @@
-name: ذخیره صفحه به MHTML
+name: MHTML ذخیره صفحه به 
 
 on:
   workflow_dispatch:
