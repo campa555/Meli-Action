@@ -34,21 +34,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3 python3-pip ffmpeg p7zip-full git
+          sudo apt-get install -y python3 python3-pip ffmpeg p7zip-full git curl
 
           python3 -m pip install --user --upgrade pip
 
-          # Install latest yt-dlp directly from GitHub master, not the older PyPI stable package.
           python3 -m pip install --user --upgrade --force-reinstall \
-            "yt-dlp[default,curl-cffi] @ git+https://github.com/yt-dlp/yt-dlp.git"
+            "yt-dlp[default,curl-cffi] @ git+https://github.com/yt-dlp/yt-dlp.git" \
+            yt-dlp-ejs
 
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
           "$HOME/.local/bin/yt-dlp" --version
           ffmpeg -version | head -n 1
+          node --version
 
       - name: Prepare optional site cookies
         env:
@@ -67,17 +73,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          URL="${{ github.event.inputs.url }}"
+          INPUT_URL="${{ github.event.inputs.url }}"
           QUALITY="${{ github.event.inputs.desired_quality }}"
 
           TMP_DIR="download_tmp"
           mkdir -p "$TMP_DIR"
-          touch marker
 
-          echo "URL: $URL"
-          echo "Quality: $QUALITY"
+          echo "Input URL: $INPUT_URL"
+          echo "Requested quality: $QUALITY"
 
-          if [ -z "$URL" ]; then
+          if [ -z "$INPUT_URL" ]; then
             echo "ERROR: URL is empty."
             exit 1
           fi
@@ -88,9 +93,45 @@ jobs:
           esac
 
           COOKIE_ARGS=()
+          CURL_COOKIE_ARGS=()
+
           if [ -s site_cookies.txt ]; then
             COOKIE_ARGS=(--cookies site_cookies.txt)
+            CURL_COOKIE_ARGS=(-b site_cookies.txt)
           fi
+
+          VIEWKEY=""
+
+          if [[ "$INPUT_URL" =~ viewkey=([^&]+) ]]; then
+            VIEWKEY="${BASH_REMATCH[1]}"
+          fi
+
+          CANDIDATE_URLS=()
+          CANDIDATE_URLS+=("$INPUT_URL")
+
+          if [ -n "$VIEWKEY" ]; then
+            CANDIDATE_URLS+=("https://www.pornhub.com/embed/${VIEWKEY}")
+            CANDIDATE_URLS+=("https://m.pornhub.com/view_video.php?viewkey=${VIEWKEY}")
+          fi
+
+          echo "Candidate URLs:"
+          printf '%s\n' "${CANDIDATE_URLS[@]}"
+
+          echo "Checking redirects/access without printing page body..."
+          for candidate in "${CANDIDATE_URLS[@]}"; do
+            echo "----"
+            echo "Checking: $candidate"
+            curl \
+              -L \
+              -sS \
+              -o /dev/null \
+              -w "HTTP code: %{http_code}\nFinal URL: %{url_effective}\n" \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+              -e "https://www.pornhub.com/" \
+              -H "Accept-Language: en-US,en;q=0.9" \
+              "${CURL_COOKIE_ARGS[@]}" \
+              "$candidate" || true
+          done
 
           FORMAT_SELECTOR="bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]/best"
 
@@ -111,66 +152,74 @@ jobs:
             --socket-timeout 30
             --no-color
             --newline
+            --js-runtimes node
           )
 
-          MAX_RETRIES=5
-          RETRY_COUNT=0
           SUCCESS=false
           NEW_FILE=""
 
-          while [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; do
-            echo "Download attempt $((RETRY_COUNT + 1))/$MAX_RETRIES"
+          for candidate in "${CANDIDATE_URLS[@]}"; do
+            echo "========================================"
+            echo "Trying candidate URL: $candidate"
+            echo "========================================"
 
-            if yt-dlp \
-              "${COMMON_ARGS[@]}" \
-              --format "$FORMAT_SELECTOR" \
-              --merge-output-format mp4 \
-              --output "$TMP_DIR/%(title).120B_%(id)s_${QUALITY}p.%(ext)s" \
-              "$URL"; then
+            for attempt in 1 2 3; do
+              echo "Download attempt $attempt/3 for this candidate"
 
-              NEW_FILE="$(find "$TMP_DIR" -type f ! -name "*.part" ! -name "*.ytdl" -print -quit || true)"
+              if yt-dlp \
+                "${COMMON_ARGS[@]}" \
+                --format "$FORMAT_SELECTOR" \
+                --merge-output-format mp4 \
+                --output "$TMP_DIR/%(title).120B_%(id)s_${QUALITY}p.%(ext)s" \
+                "$candidate"; then
 
-              if [ -n "$NEW_FILE" ]; then
-                echo "Download succeeded: $NEW_FILE"
-                SUCCESS=true
-                break
+                NEW_FILE="$(find "$TMP_DIR" -type f ! -name "*.part" ! -name "*.ytdl" -print -quit || true)"
+
+                if [ -n "$NEW_FILE" ]; then
+                  echo "Download succeeded: $NEW_FILE"
+                  SUCCESS=true
+                  break 2
+                fi
               fi
-            fi
 
-            echo "Normal extractor failed. Trying generic fallback..."
+              echo "Normal extractor failed. Trying generic fallback..."
 
-            if yt-dlp \
-              "${COMMON_ARGS[@]}" \
-              --force-generic-extractor \
-              --format "$FORMAT_SELECTOR" \
-              --merge-output-format mp4 \
-              --output "$TMP_DIR/%(title).120B_%(id)s_${QUALITY}p.%(ext)s" \
-              "$URL"; then
+              if yt-dlp \
+                "${COMMON_ARGS[@]}" \
+                --force-generic-extractor \
+                --format "$FORMAT_SELECTOR" \
+                --merge-output-format mp4 \
+                --output "$TMP_DIR/%(title).120B_%(id)s_${QUALITY}p.%(ext)s" \
+                "$candidate"; then
 
-              NEW_FILE="$(find "$TMP_DIR" -type f ! -name "*.part" ! -name "*.ytdl" -print -quit || true)"
+                NEW_FILE="$(find "$TMP_DIR" -type f ! -name "*.part" ! -name "*.ytdl" -print -quit || true)"
 
-              if [ -n "$NEW_FILE" ]; then
-                echo "Generic fallback succeeded: $NEW_FILE"
-                SUCCESS=true
-                break
+                if [ -n "$NEW_FILE" ]; then
+                  echo "Generic fallback succeeded: $NEW_FILE"
+                  SUCCESS=true
+                  break 2
+                fi
               fi
-            fi
 
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-
-            if [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; then
-              echo "Waiting 10 seconds before next attempt..."
-              sleep 10
-            fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "Waiting 10 seconds before next attempt..."
+                sleep 10
+              fi
+            done
           done
 
           if [ "$SUCCESS" = false ]; then
-            echo "ERROR: All $MAX_RETRIES download attempts failed."
+            echo "ERROR: Download failed for all candidate URLs."
+            echo ""
+            echo "Look above at the redirect/access check."
+            echo "If every candidate ends with Final URL: https://www.pornhub.com/"
+            echo "then GitHub Actions is being redirected away from the video page."
+            echo ""
             echo "Possible causes:"
-            echo "1. The site changed and yt-dlp needs an update."
-            echo "2. The video is unavailable from GitHub Actions' IP region."
-            echo "3. The site requires age/session cookies."
-            echo "4. The page is blocked by anti-bot protection."
+            echo "1. Cookies are valid locally but not enough for GitHub's datacenter IP."
+            echo "2. The video is unavailable from GitHub's region/IP."
+            echo "3. The site is showing an age/consent/bot/region page."
+            echo "4. yt-dlp's PornHub extractor is currently broken for this page."
             exit 1
           fi
 
