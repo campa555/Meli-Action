@@ -4,24 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL of the video'
+        description: "Video URL"
         required: true
         type: string
+      desired_quality:
+        description: "Video quality: 144, 240, 360, 480, 720, 1080"
+        required: false
+        type: string
+        default: "720"
+      max_part_mb:
+        description: "Maximum part size in MB. Keep 90 for GitHub safety."
+        required: false
+        type: string
+        default: "90"
       output_folder:
-        description: 'Folder where the video will be saved'
+        description: "Folder where the video will be saved"
         required: false
         type: string
-        default: 'downloads'
-      quality:
-        description: 'Video quality (yt-dlp format selector)'
-        required: true
-        type: string
-        default: 'bestvideo[height<=720]+bestaudio/best[ext=mp4]/best'
-      archive_name:
-        description: 'Base name for the RAR archive (if file is split)'
-        required: false
-        type: string
-        default: 'video'
+        default: "downloads"
 
 permissions:
   contents: write
@@ -34,108 +34,210 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install yt-dlp and bc
+      - name: Install tools
         run: |
-          pip install yt-dlp
-          sudo apt-get update && sudo apt-get install -y bc
+          sudo apt-get update -qq
+          sudo apt-get install -y python3 python3-pip ffmpeg p7zip-full git
 
-      - name: Download video (retry up to 5 times)
+          python3 -m pip install --user --upgrade pip
+
+          # Install latest yt-dlp directly from GitHub master, not the older PyPI stable package.
+          python3 -m pip install --user --upgrade --force-reinstall \
+            "yt-dlp[default,curl-cffi] @ git+https://github.com/yt-dlp/yt-dlp.git"
+
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          "$HOME/.local/bin/yt-dlp" --version
+          ffmpeg -version | head -n 1
+
+      - name: Prepare optional site cookies
+        env:
+          PH_COOKIES: ${{ secrets.PH_COOKIES }}
+        run: |
+          if [ -n "$PH_COOKIES" ]; then
+            printf '%s\n' "$PH_COOKIES" > site_cookies.txt
+            echo "Site cookies found in repository secrets."
+          else
+            echo "No site cookies secret found. Continuing without cookies."
+          fi
+
+      - name: Download video
         id: download
+        shell: bash
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          mkdir -p "$FOLDER"
+          set -euo pipefail
+
+          URL="${{ github.event.inputs.url }}"
+          QUALITY="${{ github.event.inputs.desired_quality }}"
+
+          TMP_DIR="download_tmp"
+          mkdir -p "$TMP_DIR"
           touch marker
+
+          echo "URL: $URL"
+          echo "Quality: $QUALITY"
+
+          if [ -z "$URL" ]; then
+            echo "ERROR: URL is empty."
+            exit 1
+          fi
+
+          case "$QUALITY" in
+            144|240|360|480|720|1080) ;;
+            *) QUALITY="720" ;;
+          esac
+
+          COOKIE_ARGS=()
+          if [ -s site_cookies.txt ]; then
+            COOKIE_ARGS=(--cookies site_cookies.txt)
+          fi
+
+          FORMAT_SELECTOR="bestvideo[height<=${QUALITY}]+bestaudio/best[height<=${QUALITY}]/best"
+
+          COMMON_ARGS=(
+            "${COOKIE_ARGS[@]}"
+            --verbose
+            --no-playlist
+            --restrict-filenames
+            --force-ipv4
+            --geo-bypass
+            --no-check-certificate
+            --impersonate chrome
+            --referer "https://www.pornhub.com/"
+            --add-header "Accept-Language:en-US,en;q=0.9"
+            --retries 10
+            --fragment-retries 10
+            --extractor-retries 5
+            --socket-timeout 30
+            --no-color
+            --newline
+          )
 
           MAX_RETRIES=5
           RETRY_COUNT=0
           SUCCESS=false
+          NEW_FILE=""
 
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            echo "Download attempt $((RETRY_COUNT+1))/$MAX_RETRIES"
-            yt-dlp \
-              --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
-              --format "${{ github.event.inputs.quality }}" \
+          while [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; do
+            echo "Download attempt $((RETRY_COUNT + 1))/$MAX_RETRIES"
+
+            if yt-dlp \
+              "${COMMON_ARGS[@]}" \
+              --format "$FORMAT_SELECTOR" \
               --merge-output-format mp4 \
-              --retries 3 \
-              --fragment-retries 10 \
-              --no-check-certificate \
-              --geo-bypass \
-              --no-color \
-              --ignore-errors \
-              --newline \
-              "${{ github.event.inputs.url }}" && {
-                # Verify that a new file was actually created
-                NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit)
-                if [ -n "$NEW_FILE" ]; then
-                  echo "Download succeeded: $NEW_FILE"
-                  SUCCESS=true
-                  break
-                else
-                  echo "The download command exited with code 0, but no new file was found. Retrying..."
-                fi
-              } || {
-                echo "Download attempt failed with exit code $?"
-              }
-            RETRY_COUNT=$((RETRY_COUNT+1))
-            if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-              echo "Waiting 5 seconds before next attempt..."
-              sleep 5
+              --output "$TMP_DIR/%(title).120B_%(id)s_${QUALITY}p.%(ext)s" \
+              "$URL"; then
+
+              NEW_FILE="$(find "$TMP_DIR" -type f ! -name "*.part" ! -name "*.ytdl" -print -quit || true)"
+
+              if [ -n "$NEW_FILE" ]; then
+                echo "Download succeeded: $NEW_FILE"
+                SUCCESS=true
+                break
+              fi
+            fi
+
+            echo "Normal extractor failed. Trying generic fallback..."
+
+            if yt-dlp \
+              "${COMMON_ARGS[@]}" \
+              --force-generic-extractor \
+              --format "$FORMAT_SELECTOR" \
+              --merge-output-format mp4 \
+              --output "$TMP_DIR/%(title).120B_%(id)s_${QUALITY}p.%(ext)s" \
+              "$URL"; then
+
+              NEW_FILE="$(find "$TMP_DIR" -type f ! -name "*.part" ! -name "*.ytdl" -print -quit || true)"
+
+              if [ -n "$NEW_FILE" ]; then
+                echo "Generic fallback succeeded: $NEW_FILE"
+                SUCCESS=true
+                break
+              fi
+            fi
+
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+
+            if [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; then
+              echo "Waiting 10 seconds before next attempt..."
+              sleep 10
             fi
           done
 
           if [ "$SUCCESS" = false ]; then
-            echo "Error: All $MAX_RETRIES download attempts failed."
+            echo "ERROR: All $MAX_RETRIES download attempts failed."
+            echo "Possible causes:"
+            echo "1. The site changed and yt-dlp needs an update."
+            echo "2. The video is unavailable from GitHub Actions' IP region."
+            echo "3. The site requires age/session cookies."
+            echo "4. The page is blocked by anti-bot protection."
             exit 1
           fi
 
-          FILENAME=$(basename "$NEW_FILE")
-          SIZE_BYTES=$(stat -c %s "$NEW_FILE")
-          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
-          echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
-          echo "Downloaded: $NEW_FILE (${SIZE_BYTES} bytes)"
+          FILE_SIZE_BYTES="$(stat -c%s "$NEW_FILE")"
+
+          echo "Downloaded file:"
+          ls -lh "$NEW_FILE"
+
+          printf 'file_path=%s\n' "$NEW_FILE" >> "$GITHUB_OUTPUT"
+          printf 'size_bytes=%s\n' "$FILE_SIZE_BYTES" >> "$GITHUB_OUTPUT"
+
+      - name: Move or split oversized file
         shell: bash
-
-      - name: Install RAR
-        run: sudo apt-get install -y rar
-
-      - name: Conditional split (if file > 99 MB)
-        id: split
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          FILENAME="${{ steps.download.outputs.filename }}"
-          SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
-          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
-          THRESHOLD_MB=99
+          set -euo pipefail
 
-          cd "$FOLDER"
+          OUTPUT_FOLDER="${{ github.event.inputs.output_folder }}"
+          MAX_PART_MB="${{ github.event.inputs.max_part_mb }}"
+          FILE_PATH="${{ steps.download.outputs.file_path }}"
 
-          if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
-            echo "File size ${SIZE_MB} MB exceeds ${THRESHOLD_MB} MB – splitting into 95 MB RAR parts."
-            # Append a random 6‑character hex suffix to avoid name collisions
-            RANDOM_HEX=$(openssl rand -hex 3)
-            ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
-            echo "Archive base name: ${ARCHIVE_NAME}"
-            rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
-            rm "$FILENAME"   # Remove original file after successful split
-            echo "split_done=true" >> $GITHUB_OUTPUT
-            echo "Split completed. Parts created:"
-            ls -lh "${ARCHIVE_NAME}.part"*.rar
-          else
-            echo "File size ${SIZE_MB} MB is ≤${THRESHOLD_MB} MB – keeping original file (no RAR)."
-            echo "split_done=false" >> $GITHUB_OUTPUT
+          case "$MAX_PART_MB" in
+            ''|*[!0-9]*) MAX_PART_MB="90" ;;
+          esac
+
+          if [ "$MAX_PART_MB" -lt 1 ]; then
+            MAX_PART_MB="90"
           fi
+
+          mkdir -p "$OUTPUT_FOLDER"
+
+          FILE_SIZE_BYTES="$(stat -c%s "$FILE_PATH")"
+          LIMIT_BYTES=$((MAX_PART_MB * 1024 * 1024))
+
+          BASENAME="$(basename "$FILE_PATH")"
+          ARCHIVE_BASE="${BASENAME%.*}"
+
+          echo "File size: $FILE_SIZE_BYTES bytes"
+          echo "Split limit: $MAX_PART_MB MB"
+
+          if [ "$FILE_SIZE_BYTES" -gt "$LIMIT_BYTES" ]; then
+            echo "File is larger than ${MAX_PART_MB} MB. Creating split 7z archive."
+
+            7z a -t7z -mx=5 -v"${MAX_PART_MB}m" "$OUTPUT_FOLDER/${ARCHIVE_BASE}.7z" "$FILE_PATH"
+
+            echo "Created split archive parts:"
+            ls -lh "$OUTPUT_FOLDER"
+          else
+            echo "File is small enough. Moving directly to output folder."
+            mv "$FILE_PATH" "$OUTPUT_FOLDER/"
+            ls -lh "$OUTPUT_FOLDER"
+          fi
+
+          rm -rf download_tmp
+
+      - name: Upload result as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-download
+          path: ${{ github.event.inputs.output_folder }}/
 
       - name: Commit and push to repository
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
+          OUTPUT_FOLDER="${{ github.event.inputs.output_folder }}"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$FOLDER/"
-          git commit -m "Add downloaded video(s)"
+
+          git add "$OUTPUT_FOLDER/"
+          git commit -m "Add downloaded video [skip ci]" || echo "Nothing to commit"
           git push
-          
