@@ -1,36 +1,35 @@
 name: دانلودر یوتیوب
 
-
 on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: 'YouTube video URL'
+        description: "YouTube video URL"
         required: true
         type: string
       output_format:
-        description: 'Output type'
+        description: "Output type"
         required: true
         type: choice
         options:
-          - mp4 (video)
-          - mp3 (audio only)
-        default: 'mp4 (video)'
+          - "mp4"
+          - "mp3"
+        default: "mp4"
       desired_quality:
-        description: 'Quality preset (video: 144p|360p|480p|720p|1080p; audio: 64|128|192|320kbps)'
+        description: "Video: 144, 240, 360, 480, 720, 1080. Audio: 64, 128, 192, 320"
         required: false
         type: string
-        default: '720p'
+        default: "720"
       max_part_mb:
-        description: 'Maximum part size in MB (0 = do not split)'
-        required: false
-        type: number
-        default: 90
-      output_folder:
-        description: 'Folder to store downloaded file and archives (relative to repo root)'
+        description: "Maximum part size in MB. Keep 90 for GitHub safety."
         required: false
         type: string
-        default: 'downloads'
+        default: "90"
+      output_folder:
+        description: "Folder to store downloaded files"
+        required: false
+        type: string
+        default: "downloads"
 
 permissions:
   contents: write
@@ -38,128 +37,175 @@ permissions:
 jobs:
   fetch-and-store:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - name: Clone repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y zip curl jq python3
+          sudo apt-get install -y python3 python3-pip ffmpeg p7zip-full nodejs
 
-      - name: Retrieve media file
-        id: retrieval
-        run: |
-          python3 << 'EOF'
-          import os, sys, time, re, requests
-          
-          URL = os.environ.get('INPUT_URL')
-          FMT = os.environ.get('INPUT_FORMAT') 
-          QUAL = os.environ.get('INPUT_QUALITY')
-          OUT_DIR = os.environ.get('INPUT_OUTPUT_FOLDER')
-          
-          # Normalise quality string
-          if FMT == 'mp3':
-              if QUAL not in ('64kbps','128kbps','192kbps','320kbps'):
-                  QUAL = '192kbps'
-          else:
-              if QUAL not in ('144p','360p','480p','720p','1080p'):
-                  QUAL = '720p'
-          
-          # Build the conversion request
-          pl = {
-              "url": URL,
-              "os": "linux",
-              "output": {"type": "audio" if FMT=="mp3" else "video", "format": FMT},
-          }
-          if FMT == 'mp3':
-              pl["audio"] = {"bitrate": QUAL}
-          else:
-              pl["output"]["quality"] = QUAL
-          
-          s = requests.Session()
-          s.headers.update({"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
-          s.get("https://media.ytmp3.gg/")
-          
-          resp = s.post("https://hub.ytconvert.org/api/download", json=pl, timeout=30)
-          resp.raise_for_status()
-          d = resp.json()
-          
-          status_url = d.get('statusUrl')
-          title = d.get('title', 'unknown')
-          
-          # Wait for it to become ready
-          dl = None
-          for _ in range(90):
-              time.sleep(2)
-              sr = s.get(status_url, timeout=15)
-              sd = sr.json()
-              if sd.get('status') == 'completed':
-                  dl = sd.get('downloadUrl')
-                  break
-              if sd.get('status') == 'failed':
-                  sys.exit(1)
-          
-          if not dl:
-              sys.exit(1)
-          
-          # Build a safe file name
-          v_id = (re.search(r'(?:v=|\/)([a-zA-Z0-9_-]{11})', URL) or ['', 'unknown'])[1]
-          clean_title = re.sub(r'[^a-zA-Z0-9\-_]', '_', title.replace(' ','_'))[:60].strip('_') or v_id
-          fname = f"{clean_title}_{v_id}_{QUAL}.{FMT}"
-          
-          # Save information for the next steps
-          out_dir = OUT_DIR
-          os.makedirs(out_dir, exist_ok=True)
-          with open(os.path.join(out_dir, ".download_info"), "w") as df:
-              df.write(f"{dl}\n{fname}\n{FMT}\n{QUAL}")
-          print(f"Ready: {fname}")
-          EOF
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user --upgrade "yt-dlp[default,curl-cffi]"
+
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          "$HOME/.local/bin/yt-dlp" --version
+          ffmpeg -version | head -n 1
+          node --version
+
+      - name: Prepare YouTube cookies
         env:
-          INPUT_URL: ${{ github.event.inputs.video_url }}
-          INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
-          INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
-          INPUT_OUTPUT_FOLDER: ${{ github.event.inputs.output_folder }}
-
-      - name: Download binary
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
-          OUTPUT_FOLDER="${{ github.event.inputs.output_folder }}"
-          INFO="$OUTPUT_FOLDER/.download_info"
-          DL_URL=$(head -1 "$INFO")
-          FILE_NAME=$(sed -n '2p' "$INFO")
-          mkdir -p $OUTPUT_FOLDER/parts
-          curl -sL -o "$OUTPUT_FOLDER/parts/$FILE_NAME" "$DL_URL"
-          echo "Downloaded $FILE_NAME"
+          if [ -n "$YT_COOKIES" ]; then
+            printf '%s\n' "$YT_COOKIES" > youtube_cookies.txt
+            echo "YouTube cookies found in repository secrets."
+          else
+            echo "No YouTube cookies secret found."
+            echo "The workflow will continue, but YouTube may block the download."
+          fi
 
-      - name: Split oversized files (optional)
+      - name: Download YouTube media
+        id: download
+        shell: bash
         run: |
+          set -euo pipefail
+
+          URL="${{ github.event.inputs.video_url }}"
+          FORMAT_INPUT="${{ github.event.inputs.output_format }}"
+          QUALITY="${{ github.event.inputs.desired_quality }}"
+
+          TMP_DIR="youtube_tmp"
+          mkdir -p "$TMP_DIR"
+
+          echo "URL is: $URL"
+          echo "Format is: $FORMAT_INPUT"
+          echo "Quality is: $QUALITY"
+
+          if [ -z "$URL" ]; then
+            echo "ERROR: video_url is empty."
+            exit 1
+          fi
+
+          COOKIE_ARGS=()
+          if [ -s youtube_cookies.txt ]; then
+            COOKIE_ARGS=(--cookies youtube_cookies.txt)
+          fi
+
+          COMMON_ARGS=(
+            "${COOKIE_ARGS[@]}"
+            --verbose
+            --no-playlist
+            --restrict-filenames
+            --force-ipv4
+            --geo-bypass
+            --no-check-certificate
+            --retries 10
+            --fragment-retries 10
+            --extractor-retries 5
+            --retry-sleep fragment:exp=1:20
+            --socket-timeout 30
+            --impersonate chrome
+          )
+
+          if [ "$FORMAT_INPUT" = "mp3" ]; then
+            case "$QUALITY" in
+              64|128|192|320) ;;
+              *) QUALITY="192" ;;
+            esac
+
+            yt-dlp \
+              "${COMMON_ARGS[@]}" \
+              --extract-audio \
+              --audio-format mp3 \
+              --audio-quality "${QUALITY}K" \
+              --output "$TMP_DIR/%(title).120B_%(id)s_${QUALITY}kbps.%(ext)s" \
+              "$URL"
+          else
+            case "$QUALITY" in
+              144|240|360|480|720|1080) ;;
+              *) QUALITY="720" ;;
+            esac
+
+            yt-dlp \
+              "${COMMON_ARGS[@]}" \
+              --merge-output-format mp4 \
+              --format "bv*[height<=${QUALITY}]+ba/b[height<=${QUALITY}]/best[height<=${QUALITY}]/best" \
+              --output "$TMP_DIR/%(title).120B_%(id)s_${QUALITY}p.%(ext)s" \
+              "$URL"
+          fi
+
+          DOWNLOADED_FILE="$(find "$TMP_DIR" -type f | head -n 1)"
+
+          if [ -z "$DOWNLOADED_FILE" ]; then
+            echo "ERROR: yt-dlp finished but no file was created."
+            exit 1
+          fi
+
+          echo "Downloaded file:"
+          ls -lh "$DOWNLOADED_FILE"
+
+          printf 'file_path=%s\n' "$DOWNLOADED_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Move or split oversized file
+        shell: bash
+        run: |
+          set -euo pipefail
+
           OUTPUT_FOLDER="${{ github.event.inputs.output_folder }}"
-          THRESH_MB=${{ github.event.inputs.max_part_mb }}
-          THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
-          cd "$OUTPUT_FOLDER/parts"
-          for f in *; do
-            if [ -f "$f" ]; then
-              fs=$(stat -c%s "$f")
-              if [ "$THRESH_BYTES" -gt 0 ] && [ "$fs" -gt "$THRESH_BYTES" ]; then
-                zip -r -s "${THRESH_MB}m" "../${f}.zip" "$f"
-                rm "$f"
-              else
-                mv "$f" ..
-              fi
-            fi
-          done
-          cd ../..
-          rm -rf "$OUTPUT_FOLDER/parts" "$OUTPUT_FOLDER/.download_info"
+          MAX_PART_MB="${{ github.event.inputs.max_part_mb }}"
+          FILE_PATH="${{ steps.download.outputs.file_path }}"
+
+          case "$MAX_PART_MB" in
+            ''|*[!0-9]*) MAX_PART_MB="90" ;;
+          esac
+
+          if [ "$MAX_PART_MB" -lt 1 ]; then
+            MAX_PART_MB="90"
+          fi
+
+          mkdir -p "$OUTPUT_FOLDER"
+
+          FILE_SIZE_BYTES="$(stat -c%s "$FILE_PATH")"
+          LIMIT_BYTES=$((MAX_PART_MB * 1024 * 1024))
+
+          BASENAME="$(basename "$FILE_PATH")"
+          ARCHIVE_BASE="${BASENAME%.*}"
+
+          echo "File size: $FILE_SIZE_BYTES bytes"
+          echo "Split limit: $MAX_PART_MB MB"
+
+          if [ "$FILE_SIZE_BYTES" -gt "$LIMIT_BYTES" ]; then
+            echo "File is larger than ${MAX_PART_MB} MB. Creating split 7z archive."
+
+            7z a -t7z -mx=5 -v"${MAX_PART_MB}m" "$OUTPUT_FOLDER/${ARCHIVE_BASE}.7z" "$FILE_PATH"
+
+            echo "Created split archive parts:"
+            ls -lh "$OUTPUT_FOLDER"
+          else
+            echo "File is small enough. Moving directly to output folder."
+            mv "$FILE_PATH" "$OUTPUT_FOLDER/"
+            ls -lh "$OUTPUT_FOLDER"
+          fi
+
+          rm -rf youtube_tmp
+
+      - name: Upload result as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-download
+          path: ${{ github.event.inputs.output_folder }}/
 
       - name: Push changes to repository
         run: |
+          OUTPUT_FOLDER="${{ github.event.inputs.output_folder }}"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ github.event.inputs.output_folder }}/"
+
+          git add "$OUTPUT_FOLDER/"
           git commit -m "Download YouTube media [skip ci]" || echo "Nothing to commit"
           git push
