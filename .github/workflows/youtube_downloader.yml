@@ -42,13 +42,18 @@ jobs:
       - name: Clone repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3 python3-pip ffmpeg p7zip-full nodejs
+          sudo apt-get install -y python3 python3-pip ffmpeg p7zip-full
 
           python3 -m pip install --user --upgrade pip
-          python3 -m pip install --user --upgrade "yt-dlp[default,curl-cffi]"
+          python3 -m pip install --user --upgrade "yt-dlp[default,curl-cffi]" yt-dlp-ejs
 
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -109,6 +114,8 @@ jobs:
             --retry-sleep fragment:exp=1:20
             --socket-timeout 30
             --impersonate chrome
+            --js-runtimes node
+            --remote-components ejs:github
           )
 
           if [ "$FORMAT_INPUT" = "mp3" ]; then
